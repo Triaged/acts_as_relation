@@ -46,7 +46,7 @@ module ActiveRecord
             :validate   => false,
             :dependent  => options.fetch(:dependent, :destroy),
             #:include    => options[:include],
-            :conditions => options[:conditions]
+            #:conditions => options[:conditions]
           }
 
           code = <<-EndCode
