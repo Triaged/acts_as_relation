@@ -28,19 +28,7 @@ module ActiveRecord
     end
 
     module ClassMethods
-      def acts_as(model_name, scope=nil, options={})
-        if scope.is_a?(Hash)
-          options = scope
-          scope   = nil
-        end
-
-        if options[:conditions]
-          ActiveSupport::Deprecation.warn(":conditions is no longer supported by acts_as. Please use `where()` instead. Example: `acts_as :person, -> { where(name: 'John') }`")
-        end
-        if options[:include]
-          ActiveSupport::Deprecation.warn(":include is no longer supported by acts_as. Please use `includes()` instead. Example: `acts_as :person, -> { includes(:friends) }`")
-        end
-
+      def acts_as(model_name, options={})
         name             = model_name.to_s.underscore.singularize
         class_name       = options[:class_name] || name.camelcase
         association_name = options[:as] || acts_as_association_name(name)
@@ -57,55 +45,87 @@ module ActiveRecord
             :autosave   => true,
             :validate   => false,
             :dependent  => options.fetch(:dependent, :destroy),
+            :include    => options[:include],
+            :conditions => options[:conditions]
           }
 
-          acts_as_model.module_eval do
-            singleton = class << self ; self end
-            singleton.send :define_method, :included do |base|
-              base.has_one name.to_sym, scope, has_one_options
-              base.validate "#{name}_must_be_valid".to_sym
-              base.alias_method_chain name.to_sym, :autobuild
+          code = <<-EndCode
+
+            def parent_association_attributes
+              associations = #{class_name}.reflect_on_all_associations.map(&:name)
+              ignored = ["created_at", "updated_at", "#{association_name}_id", "#{association_name}_type", "#{association_name}"]
+              (associations - ignored).collect {|a| a.to_s + '_id'}
+            end
+
+            def self.included(base)
+              base.has_one :#{name}, #{has_one_options}
+              base.validate :#{name}_must_be_valid
+              base.alias_method_chain :#{name}, :autobuild
 
               base.extend ActiveRecord::ActsAsRelation::AccessMethods
-              attributes = class_name.constantize.content_columns.map(&:name)
-              associations = class_name.constantize.reflect_on_all_associations.map(&:name)
+              attributes = #{class_name}.content_columns.map(&:name)
+              associations = #{class_name}.reflect_on_all_associations.map(&:name)
               ignored = ["created_at", "updated_at", "#{association_name}_id", "#{association_name}_type", "#{association_name}"]
               attributes_to_delegate = attributes + associations - ignored
-              base.send :define_acts_as_accessors, attributes_to_delegate, name
+              base.send :define_acts_as_accessors, attributes_to_delegate, "#{name}"
 
-              if defined?(::ProtectedAttributes)
-                base.attr_accessible.update(class_name.constantize.attr_accessible)
+              base.attr_accessible.update(#{class_name}.attr_accessible)
+            end
+
+            def #{name}_with_autobuild
+              #{name}_without_autobuild || build_#{name}
+            end
+
+            def method_missing method, *arg, &block
+              raise NoMethodError if method.to_s == 'id' || method.to_s == '#{name}'
+
+              #{name}.send(method, *arg, &block)
+            rescue NoMethodError
+              super
+            end
+
+            def respond_to?(method, include_private_methods = false)
+              super || #{name}.respond_to?(method, include_private_methods)
+            end
+
+            def [](key)
+              if parent_association_attributes.include? key.to_s
+                #{name}[key]
+              else
+                super
               end
             end
 
-            define_method "#{name}_with_autobuild" do
-              send("#{name}_without_autobuild") || send("build_#{name}")
-            end
-
-            define_method :method_missing do |method, *arg, &block|
-              begin
-                raise NoMethodError if method.to_s == 'id' || method.to_s == name
-
-                send(name).send(method, *arg, &block)
-              rescue NoMethodError
-                super(method, *arg, &block)
+            def []=(key, value)
+              if parent_association_attributes.include? key.to_s
+                #{name}[key] = value
+              else
+                super
               end
             end
 
-            define_method 'respond_to?' do |method, include_private_methods = false|
-              super(method, include_private_methods) || send(name).respond_to?(method, include_private_methods)
+            def is_a?(model_class)
+              if model_class.name.underscore.to_sym == :#{name}
+                return true
+              else
+                super
+              end
             end
+            alias_method :instance_of?, :is_a?
+            alias_method :kind_of?, :is_a?
 
             protected
 
-            define_method "#{name}_must_be_valid" do
-              unless send(name).valid?
-                send(name).errors.each do |att, message|
+            def #{name}_must_be_valid
+              unless #{name}.valid?
+                #{name}.errors.each do |att, message|
                   errors.add(att, message)
                 end
               end
             end
-          end
+
+          EndCode
+          acts_as_model.module_eval code, __FILE__, __LINE__
         end
 
         class_eval do
@@ -113,10 +133,10 @@ module ActiveRecord
         end
 
         if options.fetch :auto_join, true
-          class_eval "default_scope -> { joins(:#{name}) }"
+          class_eval "default_scope joins(:#{name})"
         end
 
-        class_eval "default_scope -> { includes(:#{name}) }"
+        class_eval "default_scope includes(:#{name})"
 
         code = <<-EndCode
           def acts_as_other_model?
@@ -141,6 +161,25 @@ module ActiveRecord
             self.#{association_name}
           end
           alias :specific_class :specific
+
+          def method_missing method, *arg, &block
+            if specific and specific.respond_to?(method, false)
+              specific.send(method, *arg, &block)
+            else
+              super
+            end
+          end
+
+          def is_a?(model_class)
+            if specific and specific.class == model_class
+              return true
+            else
+              super
+            end
+          end
+          alias_method :instance_of?, :is_a?
+          alias_method :kind_of?, :is_a?
+
         EndCode
         class_eval code, __FILE__, __LINE__
       end
@@ -149,15 +188,6 @@ module ActiveRecord
       def acts_as_association_name model_name=nil
         model_name ||= self.name
         "as_#{model_name.to_s.demodulize.singularize.underscore}"
-      end
-    end
-    
-    def is_a?(model_class)
-      begin
-        return true if model_class == self.class
-        return true if self.class.acts_as_other_model? and self.class.acts_as_model_name == model_class.name.underscore.to_sym
-      rescue
-        return self.kind_of? model_class
       end
     end
   end
