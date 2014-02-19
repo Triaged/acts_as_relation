@@ -45,7 +45,7 @@ module ActiveRecord
             :autosave   => true,
             :validate   => false,
             :dependent  => options.fetch(:dependent, :destroy),
-            :include    => options[:include],
+            #:include    => options[:include],
             :conditions => options[:conditions]
           }
 
