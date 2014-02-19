@@ -161,7 +161,6 @@ module ActiveRecord
       end
     end
   end
-  end
 end
 
 class ActiveRecord::Base
